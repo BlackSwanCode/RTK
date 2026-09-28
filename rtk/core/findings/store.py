@@ -14,7 +14,7 @@ try:
 except ImportError:
     raise RuntimeError("sqlcipher3 is required for RTK V1. Install via 'poetry add sqlcipher3'")
 
-from rtk.core.findings.schema import Finding
+from rtk.core.findings.schema import Finding, MCPCall
 from rtk.core.logging import get_logger
 
 log = get_logger("findings.store")
@@ -35,6 +35,24 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE INDEX IF NOT EXISTS idx_mission ON findings(mission_id);
 """
 
+_MCP_CALLS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mcp_calls (
+    id            TEXT PRIMARY KEY,
+    mission_id    TEXT NOT NULL,
+    session_id    TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    method        TEXT NOT NULL,
+    tool_name     TEXT,
+    args_hash     TEXT NOT NULL,
+    args_summary  TEXT NOT NULL,
+    result_hash   TEXT NOT NULL,
+    result_summary TEXT NOT NULL,
+    latency_ms    REAL NOT NULL,
+    success       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_mission ON mcp_calls(mission_id);
+"""
+
 
 class FindingsStore:
     def __init__(self, path: str | Path, encryption_key: str = "rtk-dev-key") -> None:
@@ -46,7 +64,7 @@ class FindingsStore:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(f"PRAGMA key = '{self.encryption_key}'")
-            conn.executescript(_SCHEMA)
+            conn.executescript(_SCHEMA + _MCP_CALLS_SCHEMA)
         log.info("findings_store_initialized", extra={"path": str(self.path)})
 
     @contextmanager
@@ -124,3 +142,36 @@ class FindingsStore:
         findings = self.list(mission_id)
         out.write_text(json.dumps([f.model_dump(mode="json") for f in findings], indent=2, default=str))
         return out
+
+    def add_mcp_call(self, call: MCPCall) -> None:
+        """Persiste un appel MCP (télémétrie) dans la base chiffrée."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO mcp_calls
+                   (id, mission_id, session_id, timestamp_utc, method, tool_name,
+                    args_hash, args_summary, result_hash, result_summary, latency_ms, success)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(call.id), str(call.mission_id), call.session_id, call.timestamp_utc.isoformat(),
+                    call.method, call.tool_name, call.args_hash, call.args_summary,
+                    call.result_hash, call.result_summary, call.latency_ms, int(call.success),
+                ),
+            )
+
+    def list_mcp_calls(self, mission_id: UUID) -> list[MCPCall]:
+        """Liste la télémétrie MCP pour une mission (non couvert par le chain_hash des findings)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT id, mission_id, session_id, timestamp_utc, method, tool_name,
+                          args_hash, args_summary, result_hash, result_summary, latency_ms, success
+                   FROM mcp_calls WHERE mission_id = ? ORDER BY timestamp_utc ASC""",
+                (str(mission_id),),
+            ).fetchall()
+        return [
+            MCPCall(
+                id=r[0], mission_id=r[1], session_id=r[2], timestamp_utc=r[3], method=r[4],
+                tool_name=r[5], args_hash=r[6], args_summary=r[7], result_hash=r[8],
+                result_summary=r[9], latency_ms=r[10], success=bool(r[11]),
+            )
+            for r in rows
+        ]

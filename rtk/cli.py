@@ -6,8 +6,10 @@ import json
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import typer
+import uvicorn
 import yaml
 from rich.console import Console
 from rich.table import Table
@@ -15,7 +17,7 @@ from rich.table import Table
 from rtk.core.findings.schema import Target
 from rtk.core.findings.store import FindingsStore
 from rtk.core.logging import configure, get_logger
-from rtk.core.scope.parser import ScopeError, load_scope
+from rtk.core.scope.parser import ScopeError, assert_in_scope, load_scope
 from rtk.reporting.minimal_report import generate_report
 
 console = Console()
@@ -137,3 +139,48 @@ def generate_report_cmd(
 
     out_path = generate_report(store, mid, output)
     console.print(f"[bold green]Report generated:[/] {out_path.absolute()}")
+
+
+@app.command("proxy")
+def proxy_start(
+    target: str = typer.Option(..., "--target", help="URL cible, ex: mcp://127.0.0.1:8000"),
+    listen_port: int = typer.Option(8080, "--listen", help="Port d'écoute du proxy"),
+    scope_path: Path = typer.Option(..., "--scope", exists=True, dir_okay=False),
+    db: Path = typer.Option(..., "--db", dir_okay=False),
+    mission_id: str = typer.Option(..., "--mission-id"),
+) -> None:
+    """Démarre un proxy MCP transparent après validation du scope."""
+    # 1. Parsing de l'URL cible pour la vérification de scope
+    parsed = urlparse(target)
+    if parsed.scheme != "mcp":
+        console.print("[bold red]Error:[/] Target must use 'mcp://' scheme")
+        raise typer.Exit(code=2)
+
+    # Mapping vers le schéma Target existant (on utilise 'aws' comme fallback par défaut
+    # pour l'infrastructure testée, l'account_id est dérivé du host pour l'exemple)
+    target_obj = Target(
+        cloud="aws",
+        account_id=parsed.hostname.replace(".", "")[:12] or "000000000000",
+        region="us-east-1"
+    )
+
+    # 2. Vérification de scope AVANT tout démarrage
+    scope = load_scope(scope_path)
+    try:
+        assert_in_scope(target_obj, scope, module="rtk.proxy.mcp_proxy")
+    except ScopeError as exc:
+        console.print(f"[bold red]Scope violation:[/] {exc}")
+        raise typer.Exit(code=2)
+
+    # 3. Initialisation du store et du proxy
+    store = FindingsStore(db)
+
+    # Injection de l'état dans le module proxy
+    from rtk.proxy import mcp_proxy
+    mcp_proxy.init_proxy(target, mission_id, store)
+
+    console.print(f"[bold green]Starting MCP Proxy[/] on port {listen_port} -> {target}")
+    console.print(f"Session ID: {mcp_proxy._proxy_state['session_id']}")
+
+    # 4. Démarrage du serveur Uvicorn
+    uvicorn.run(mcp_proxy.app, host="0.0.0.0", port=listen_port, log_level="warning")

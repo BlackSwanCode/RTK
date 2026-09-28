@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "rtk"
+version = "0.1.0"
+description = "Red Team Toolkit — internal offensive security tooling (authorized engagements only)"
+authors = ["RTK Team <redteam@internal>"]
+readme = "README.md"
+packages = [{include = "rtk"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+typer = "^0.12.3"
+pydantic = "^2.7"
+rich = "^13.7"
+pyyaml = "^6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2"
+
+[tool.poetry.scripts]
+rtk = "rtk.cli:app"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

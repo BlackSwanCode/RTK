@@ -1,9 +1,12 @@
-"""Typer-based CLI entrypoint for RTK (V2)."""
+"""Typer-based CLI entrypoint for RTK (V4)."""
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -12,16 +15,21 @@ import typer
 import uvicorn
 import yaml
 from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
 
+from rtk.core.cloud.verify import verify_env_tag
 from rtk.core.findings.schema import Target
 from rtk.core.findings.store import FindingsStore
+from rtk.core.judge.protocol import DeterministicJudge
 from rtk.core.logging import configure, get_logger
 from rtk.core.scope.parser import ScopeError, assert_in_scope, load_scope
+from rtk.harness.corpus_runner import load_corpus, run_case
 from rtk.reporting.minimal_report import generate_report
 
 console = Console()
-app = typer.Typer(help="Red Team Toolkit V2 — authorized engagements only")
+app = typer.Typer(help="Red Team Toolkit V4 — authorized engagements only")
 configure()
 log = get_logger("cli")
 
@@ -148,9 +156,19 @@ def proxy_start(
     scope_path: Path = typer.Option(..., "--scope", exists=True, dir_okay=False),
     db: Path = typer.Option(..., "--db", dir_okay=False),
     mission_id: str = typer.Option(..., "--mission-id"),
+    mode: str = typer.Option("passthrough", "--mode", help="passthrough, enforce, poison"),
+    enforce_allowlist: str | None = typer.Option(None, "--enforce-allowlist", help="Comma-separated tools"),
+    poison_tool: str | None = typer.Option(None, "--poison-tool"),
+    poison_payload: str | None = typer.Option(None, "--poison-payload"),
+    timeout_minutes: int = typer.Option(30, "--timeout", help="Poison mode auto-deactivation"),
+    i_understand_poison_mode: bool = typer.Option(False, "--i-understand-poison-mode", is_flag=True),
 ) -> None:
-    """Démarre un proxy MCP transparent après validation du scope."""
-    # 1. Parsing de l'URL cible pour la vérification de scope
+    """Démarre le proxy MCP (passthrough, enforce ou poison selon --mode)."""
+    # 1. Garde-fou Poison : Flag CLI
+    if mode == "poison" and not i_understand_poison_mode:
+        console.print("[bold red]ERROR:[/] Poison mode requires --i-understand-poison-mode flag.")
+        raise typer.Exit(code=2)
+
     parsed = urlparse(target)
     if parsed.scheme != "mcp":
         console.print("[bold red]Error:[/] Target must use 'mcp://' scheme")
@@ -163,24 +181,82 @@ def proxy_start(
         account_id=parsed.hostname.replace(".", "")[:12] or "000000000000",
         region="us-east-1"
     )
-
-    # 2. Vérification de scope AVANT tout démarrage
     scope = load_scope(scope_path)
+
     try:
         assert_in_scope(target_obj, scope, module="rtk.proxy.mcp_proxy")
     except ScopeError as exc:
         console.print(f"[bold red]Scope violation:[/] {exc}")
         raise typer.Exit(code=2)
 
-    # 3. Initialisation du store et du proxy
+    # 2. Garde-fou Poison : Vérification d'environnement réelle (Fail-Closed)
+    if mode == "poison":
+        try:
+            verify_env_tag(target_obj.cloud, target_obj.account_id, target_obj.region)
+        except Exception as e:
+            console.print(f"[bold red]Fail-Closed:[/] Environment tag verification failed. {e}")
+            raise typer.Exit(code=2)
+
     store = FindingsStore(db)
-
-    # Injection de l'état dans le module proxy
     from rtk.proxy import mcp_proxy
-    mcp_proxy.init_proxy(target, mission_id, store)
+    mcp_proxy.init_proxy(
+        target, mission_id, store, mode=mode,
+        enforce_allowlist=enforce_allowlist.split(",") if enforce_allowlist else None,
+        poison_tool=poison_tool, poison_payload=poison_payload, timeout_minutes=timeout_minutes
+    )
 
-    console.print(f"[bold green]Starting MCP Proxy[/] on port {listen_port} -> {target}")
+    # 3. Bannière Rich continue pour le mode poison
+    def poison_banner_task():
+        with Live(Panel("[bold red blink]⚠️ POISON MODE ACTIVE ⚠️\nInteracting with target. Auto-deactivates on timeout.", border_style="red"), refresh_per_second=2) as live:
+            while mcp_proxy._proxy_state["mode"] == "poison":
+                time.sleep(1)
+            live.update(Panel("[bold yellow]Poison mode deactivated (timeout or manual).[/]", border_style="yellow"))
+
+    if mode == "poison":
+        banner_thread = threading.Thread(target=poison_banner_task, daemon=True)
+        banner_thread.start()
+
+    console.print(f"[bold green]Starting MCP Proxy[/] on port {listen_port} -> {target} (Mode: {mode})")
     console.print(f"Session ID: {mcp_proxy._proxy_state['session_id']}")
 
     # 4. Démarrage du serveur Uvicorn
     uvicorn.run(mcp_proxy.app, host="0.0.0.0", port=listen_port, log_level="warning")
+
+
+@app.command("run-corpus")
+def run_corpus(
+    corpus_dir: Path = typer.Option(..., "--corpus", dir_okay=True),
+    target: str = typer.Option(..., "--target"),
+    scope_path: Path = typer.Option(..., "--scope", exists=True, dir_okay=False),
+    db: Path = typer.Option(..., "--db", dir_okay=False),
+    mission_id: str = typer.Option(..., "--mission-id"),
+    judge_type: str = typer.Option("deterministic", "--judge"),
+    proxy_port: int = typer.Option(8080, "--proxy-port", help="Port du proxy actif à tester"),
+) -> None:
+    """Exécute un corpus de tests (llm_mcp) contre le proxy MCP déjà démarré."""
+    scope = load_scope(scope_path)
+    parsed = urlparse(target)
+    target_obj = Target(cloud="aws", account_id=parsed.hostname.replace(".", "")[:12] or "000000000000")
+    store = FindingsStore(db)
+    mid = uuid.UUID(mission_id)
+
+    assert_in_scope(target_obj, scope, module="rtk.harness.corpus_runner")
+
+    cases = load_corpus(corpus_dir)
+    judge = DeterministicJudge()
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+    console.print(f"[bold cyan]Running {len(cases)} test cases against {proxy_url}[/]")
+
+    async def _run_all():
+        findings_count = 0
+        for case in cases:
+            finding = await run_case(case, proxy_url, judge, store, target_obj, mid)
+            if finding:
+                findings_count += 1
+                console.print(f"  [red]BYPASS/FAIL:[/] {case.id} - {finding.observed.summary[:60]}")
+            else:
+                console.print(f"  [green]PASS/SKIP:[/] {case.id}")
+        console.print(f"\n[bold]Corpus complete. {findings_count} finding(s) generated.[/]")
+
+    asyncio.run(_run_all())

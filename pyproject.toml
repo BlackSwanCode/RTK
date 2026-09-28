@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "rtk"
-version = "0.4.0"
-description = "Red Team Toolkit — internal offensive security tooling (V3)"
+version = "0.5.0"
+description = "Red Team Toolkit — internal offensive security tooling (V4)"
 authors = ["RTK Team <redteam@internal>"]
 packages = [{include = "rtk"}]
 
@@ -19,6 +19,9 @@ jinja2 = "^3.1"
 httpx = "^0.27.0"
 uvicorn = "^0.30.0"
 fastapi = "^0.110.0"
+
+[tool.poetry.group.gcp.dependencies]
+google-cloud-resource-manager = "^1.12.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2"

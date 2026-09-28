@@ -25,7 +25,7 @@ def scope_yaml_path(tmp_path: Path) -> Path:
             "start": (now - timedelta(days=1)).isoformat(),
             "end": (now + timedelta(days=30)).isoformat(),
         },
-        "authorized_modules": ["rtk.modules.demo.ping", "rtk.modules.iam.wildcard_policies"],
+        "authorized_modules": ["rtk.modules.demo.ping", "rtk.modules.iam.wildcard_policies", "rtk.modules.buckets.enum_buckets"],
         "env_tag_required": "staging",
     }
     path = tmp_path / "scope.yaml"

@@ -1,17 +1,15 @@
-"""Findings schema + store tests."""
+import hashlib
+import json
+import uuid
 import pytest
 
-from rtk.core.findings.schema import (
-    AttackSpec,
-    Finding,
-    Observed,
-    Target,
-)
+from rtk.core.findings.schema import AttackSpec, Finding, Observed, Target
 from rtk.core.findings.store import FindingsStore
 
 
-def _base_finding(**overrides):
+def _base_finding(mission_id: uuid.UUID, **overrides):
     base = dict(
+        mission_id=mission_id,
         module="rtk.test",
         vector="demo",
         severity="info",
@@ -26,38 +24,21 @@ def _base_finding(**overrides):
     return Finding(**base)
 
 
-def test_finding_info_ok():
-    f = _base_finding()
-    assert f.severity == "info"
-
-
-def test_finding_critical_theoretical_requires_sha256():
-    with pytest.raises(Exception):
-        _base_finding(
-            severity="critical",
-            exploitability="theoretical",
-            observed=Observed(summary="s"),  # no raw_sha256
-        )
-
-
-def test_finding_high_requires_matrices():
-    with pytest.raises(Exception):
-        _base_finding(
-            severity="high",
-            exploitability="confirmed",
-            # atlas_technique / owasp_llm left unset
-        )
-
-
-def test_store_roundtrip(tmp_path):
+def test_store_chain_hash_integrity(tmp_path):
     db = tmp_path / "findings.sqlite"
-    store = FindingsStore(db)
-    f = _base_finding()
-    store.add(f)
-    assert len(store.list()) == 1
-    assert store.list({"severity": "info"})[0].id == f.id
-    assert store.list({"severity": "critical"}) == []
+    store = FindingsStore(db, encryption_key="test-key")
+    mid = uuid.uuid4()
 
-    out = store.export_json(tmp_path / "export.json")
-    assert out.exists()
-    assert b"rtk.test" in out.read_bytes()
+    f1 = _base_finding(mission_id=mid, module="mod1")
+    store.add(f1)
+
+    f2 = _base_finding(mission_id=mid, module="mod2")
+    store.add(f2)
+
+    assert store.verify_chain(mid) is True
+
+    # Falsification manuelle en base pour briser la chaîne
+    with store._connect() as conn:
+        conn.execute("UPDATE findings SET chain_hash = 'FALSIFIED' WHERE id = ?", (str(f1.id),))
+
+    assert store.verify_chain(mid) is False

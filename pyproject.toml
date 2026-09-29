@@ -21,6 +21,9 @@ uvicorn = "^0.30.0"
 fastapi = "^0.110.0"
 owslib = "^0.31.0"      # Pour l'analyse des capacités OGC (WMS/WFS)
 subprocess-run = "^0.0.1" # (Optionnel, stdlib suffit, mais on note l'usage de gitleaks)
+azure-identity = "^1.15.0"
+azure-storage-blob = "^12.19.0"
+azure-mgmt-resource = "^23.0.0"
 
 [tool.poetry.group.gcp.dependencies]
 google-cloud-resource-manager = "^1.12.0"

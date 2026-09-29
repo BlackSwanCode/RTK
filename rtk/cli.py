@@ -1,4 +1,4 @@
-"""Typer-based CLI entrypoint for RTK (Unified V4+).
+"""Typer-based CLI entrypoint for RTK (Unified V5+).
 
 This module serves as the single entry point for all Red Team Toolkit operations.
 It enforces scope validation, structured logging, and safe execution of modules.
@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import typer
@@ -269,25 +270,28 @@ def proxy_start(
 def run_module(
     module: str = typer.Argument(
         ...,
-        help="Dotted module path, e.g., demo.ping, iam.wildcard_policies, gis_meteo.ogc_anonymous_access",
+        help="Dotted module path, e.g., demo.ping, iam.wildcard_policies, buckets.enum_buckets",
     ),
     target: str = typer.Option(..., "--target", help="JSON-encoded Target object"),
     scope_path: Path = typer.Option(..., "--scope", exists=True, dir_okay=False),
     db: Path = typer.Option(..., "--db", dir_okay=False),
     mission_id: str = typer.Option(..., "--mission-id"),
     # --- Module-specific optional arguments (resolved dynamically) ---
-    policies_dir: Path | None = typer.Option(None, "--policies-dir", dir_okay=True),
-    org: str | None = typer.Option(None, "--org", help="Org name for bucket enum"),
-    envs: str | None = typer.Option(None, "--envs", help="Comma-separated envs for bucket enum"),
-    corpus_dir: Path | None = typer.Option(None, "--corpus", dir_okay=True),
+    policies_dir: Path | None = typer.Option(None, "--policies-dir", dir_okay=True, help="Directory with IAM policies (RTK-07)"),
+    org: str | None = typer.Option(None, "--org", help="Org name for bucket enumeration (RTK-04)"),
+    envs: str | None = typer.Option(None, "--envs", help="Comma-separated envs for bucket enum (RTK-04)"),
+    corpus_dir: Path | None = typer.Option(None, "--corpus", dir_okay=True, help="Corpus directory for LLM tests (RTK-10/11)"),
     judge_type: str = typer.Option("deterministic", "--judge", help="Judge type for corpus runner"),
     proxy_port: int = typer.Option(8080, "--proxy-port", help="Port of the running proxy to test against"),
-    ogc_endpoints: str | None = typer.Option(None, "--ogc-endpoints", help="Comma-separated OGC URLs"),
-    repos_dir: Path | None = typer.Option(None, "--repos-dir", dir_okay=True),
-    mcp_endpoint: str | None = typer.Option(None, "--mcp-endpoint", help="MCP server URL for tool watch/exfil"),
-    baseline_file: Path | None = typer.Option(None, "--baseline-file", help="Baseline JSON for tool watch"),
-    listener_url: str | None = typer.Option(None, "--listener-url", help="Exfil listener URL"),
-    endpoints: str | None = typer.Option(None, "--endpoints", help="Comma-separated URLs for error leakage"),
+    ogc_endpoints: str | None = typer.Option(None, "--ogc-endpoints", help="Comma-separated OGC URLs (RTK-20)"),
+    repos_dir: Path | None = typer.Option(None, "--repos-dir", dir_okay=True, help="Directory with git repos (RTK-01)"),
+    mcp_endpoint: str | None = typer.Option(None, "--mcp-endpoint", help="MCP server URL for tool watch/exfil (RTK-13/14)"),
+    baseline_file: Path | None = typer.Option(None, "--baseline-file", help="Baseline JSON for tool watch (RTK-13)"),
+    listener_url: str | None = typer.Option(None, "--listener-url", help="Exfil listener URL (RTK-14)"),
+    endpoints: str | None = typer.Option(None, "--endpoints", help="Comma-separated URLs for error leakage (RTK-02)"),
+    buckets_file: Path | None = typer.Option(None, "--buckets-file", help="JSON file with bucket list (RTK-05)"),
+    domains: str | None = typer.Option(None, "--domains", help="Comma-separated domains for surface mapping (RTK-08)"),
+    storage_accounts: str | None = typer.Option(None, "--storage-accounts", help="Comma-separated Azure storage accounts"),
 ) -> None:
     """Execute a module end-to-end: scope validation → execution → store."""
 
@@ -337,7 +341,7 @@ def run_module(
             {
                 "org": org,
                 "envs": [e.strip() for e in envs.split(",")],
-                "suffixes": ["data", "logs", "backup", "assets"],
+                "suffixes": ["data", "logs", "backup", "assets", "tiles", "raw", "dem", "radar"],
             }
         ]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
@@ -368,6 +372,19 @@ def run_module(
 
     if "endpoints" in sig.parameters and endpoints:
         kwargs["endpoints"] = [e.strip() for e in endpoints.split(",")]
+
+    if "buckets" in sig.parameters and buckets_file:
+        try:
+            kwargs["buckets"] = json.loads(buckets_file.read_text())
+        except Exception as e:
+            console.print(f"[bold red]Error reading buckets file:[/] {e}")
+            raise typer.Exit(code=2)
+
+    if "domains" in sig.parameters and domains:
+        kwargs["domains"] = [d.strip() for d in domains.split(",")]
+
+    if "storage_accounts" in sig.parameters and storage_accounts:
+        kwargs["storage_accounts"] = [a.strip() for a in storage_accounts.split(",")]
 
     # 4. Execution
     console.print(f"[bold cyan]▶ Executing module:[/] {mod_name}")

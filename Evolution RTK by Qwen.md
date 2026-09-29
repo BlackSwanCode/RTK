@@ -1,5 +1,7 @@
 Pour faire passer le RTK au niveau **"Ultimate"**, voici les modules et capacités manquants, classés par priorité stratégique :
 
+> **Mise à jour du 29 septembre 2026.** Le dépôt livré (v0.5.0) a depuis implémenté 10 des 20 vecteurs de la matrice, dont deux qui figuraient dans la liste « manquants » ci-dessous : **RTK-05** (`buckets.cors_traversal`) et **RTK-08** (`network.external_surface`). Ils sont marqués ✅ **Implémenté** ci-dessous et retirés du calcul d'effort restant ; le reste de l'analyse (priorités, efforts estimés) reste valable tel quel pour les vecteurs encore manquants. Le détail complet de la couverture actuelle (10/20) figure dans `rapport_technique_rtk.md`, §7.
+
 ---
 
 ## 🔴 Modules manquants de la matrice (couverture complète)
@@ -9,14 +11,13 @@ Pour faire passer le RTK au niveau **"Ultimate"**, voici les modules et capacit�
 - **Implémentation** : Corpus de 30+ techniques (repeat text above, rôles alternés, encodage base64, DAN variants, reformulation bénigne).
 - **Effort** : 3-4 jours (corpus + intégration au runner existant).
 
-### **RTK-05 : CORS & traversée de préfixe buckets** *(Moyenne)*
+### **RTK-05 : CORS & traversée de préfixe buckets** *(Moyenne)* — ✅ **Implémenté**
 - **Pourquoi** : Complète RTK-04. Un bucket accessible anonymement peut avoir une config CORS permettant à un site tiers de lire ses données, ou un service de tuiles peut permettre d'accéder à des objets hors préfixe.
-- **Effort** : 2 jours.
+- **Statut** : livré sous `rtk.modules.buckets.cors_traversal`.
 
-### **RTK-08 : Cartographie surface externe** *(Haute)*
+### **RTK-08 : Cartographie surface externe** *(Haute)* — ✅ **Implémenté**
 - **Pourquoi** : Détecter les endpoints oubliés (serveur MCP de dev exposé, API LLM sans auth). Indispensable avant de lancer les tests offensifs.
-- **Implémentation** : Orchestration `subfinder` → `httpx` → fingerprinting (signatures MCP, WMS, LLM).
-- **Effort** : 3 jours.
+- **Statut** : livré sous `rtk.modules.network.external_surface`, conforme à l'implémentation envisagée : énumération de sous-domaines via `subfinder` (avec repli silencieux si le binaire est absent) puis fingerprinting HTTP par signatures MCP/LLM/WMS.
 
 ### **RTK-09 : Contournement WAF** *(Moyenne)*
 - **Pourquoi** : Valider que les garde-fous réseau (AWS WAF, Cloud Armor) résistent aux techniques d'évasion connues.
@@ -132,7 +133,7 @@ Pour faire passer le RTK au niveau **"Ultimate"**, voici les modules et capacit�
 
 | Phase | Contenu | Durée | Priorité |
 |-------|---------|-------|----------|
-| **Phase 1** | Couverture complète des 20 vecteurs (RTK-03, 05, 08, 09, 12, 15, 16, 17, 19) | 3 semaines | 🔴 Critique |
+| **Phase 1** | Couverture complète des 20 vecteurs — restant : RTK-03, 09, 12, 15, 16, 17, 19 (RTK-05 et RTK-08 livrés) | ~2 semaines | 🔴 Critique |
 | **Phase 2** | Techniques avancées LLM + OpenTelemetry + Double évaluation | 2 semaines | 🟡 Haute |
 | **Phase 3** | Modules fine-tuning + Supply chain modèles + RGPD GIS | 2 semaines | 🟡 Haute (si scope) |
 | **Phase 4** | Reporting avancé + Dashboard dérive + Surveillance continue | 2 semaines | 🟢 Moyenne |
@@ -142,16 +143,16 @@ Pour faire passer le RTK au niveau **"Ultimate"**, voici les modules et capacit�
 
 ---
 
-## 🎯 Recommandation immédiate
+## 🎯 Recommandation immédiate (mise à jour)
 
-Pour un passage rapide au niveau "Ultimate", je recommande de prioriser :
+RTK-08 (cartographie de surface), initialement en tête de liste, est désormais livré. Pour la suite du passage au niveau "Ultimate", je recommande de prioriser :
 
-1. **RTK-03** (extraction secrets via LLM) — critique, bloque le reporting complet
-2. **RTK-12** (agentivité excessive) — cœur métier LLM+MCP
-3. **RTK-08** (cartographie surface) — prérequis pour tout test offensif
+1. **RTK-03** (extraction secrets via LLM) — toujours critique, bloque le reporting complet sur le périmètre LLM+MCP
+2. **RTK-12** (agentivité excessive) — cœur métier LLM+MCP, non traité
+3. **RTK-19** (angles morts journalisation) — complète naturellement `audit.mttd_closed_loop`, déjà livré pour AWS/CloudTrail
 4. **OpenTelemetry** — instrumente le MTTD fin
 5. **Reporting avancé** — livrable client professionnel
 
-Ces 5 chantiers représentent ~2 semaines de dev et couvrent 80% de la valeur ajoutée "Ultimate".
+Ces 5 chantiers représentent ~2 semaines de dev et couvrent l'essentiel de la valeur ajoutée "Ultimate" restante.
 
 Souhaitez-vous que je génère l'implémentation complète de l'un de ces modules manquants ?

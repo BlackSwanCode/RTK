@@ -19,6 +19,8 @@ jinja2 = "^3.1"
 httpx = "^0.27.0"
 uvicorn = "^0.30.0"
 fastapi = "^0.110.0"
+owslib = "^0.31.0"      # Pour l'analyse des capacités OGC (WMS/WFS)
+subprocess-run = "^0.0.1" # (Optionnel, stdlib suffit, mais on note l'usage de gitleaks)
 
 [tool.poetry.group.gcp.dependencies]
 google-cloud-resource-manager = "^1.12.0"
@@ -27,6 +29,7 @@ google-cloud-resource-manager = "^1.12.0"
 pytest = "^8.2"
 pytest-mock = "^3.14"
 pytest-asyncio = "^0.23.0"
+responses = "^0.25.0"   # Pour mocker les requêtes HTTP OGC dans les tests
 
 [tool.poetry.scripts]
 rtk = "rtk.cli:app"

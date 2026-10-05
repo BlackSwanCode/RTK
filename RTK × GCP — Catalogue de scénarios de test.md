@@ -16,11 +16,239 @@
 | 8 | `llm_mcp.tool_poisoning_watch` (RTK-13) | Serveur MCP (FastMCP) sur Cloud Run, dérive de schéma d'outil | info/high |
 | 9 | `llm_mcp.exfil_channels` (RTK-14) | Même serveur MCP, outil `http_get` sans allowlist de sortie | critical |
 
-Les scénarios 1 à 3 ont été détaillés plus haut dans la conversation (bucket public, CORS/traversée, WMS anonyme) — ils ne sont pas repris ici en intégral, seulement rappelés dans le tableau ci-dessus pour la vue d'ensemble.
+## Prérequis communs (scénarios 1 à 9)
+
+```bash
+git clone <votre repo> rtk && cd rtk
+poetry install --with gcp
+gcloud auth login
+gcloud config set project VOTRE_PROJET_GCP_SANDBOX
+```
+
+`scope.yaml` commun (à compléter dans `authorized_modules` au fur et à mesure) :
+
+```yaml
+engagement_id: "ENG-2026-LAB-GCP"
+accounts:
+  gcp: ["VOTRE_PROJET_GCP_SANDBOX"]
+domains: ["votredomaine-lab.example.com"]
+ip_ranges: []
+excluded_resources: []
+engagement_window:
+  start: "2026-10-04T00:00:00Z"
+  end: "2026-10-18T23:59:59Z"
+authorized_modules:
+  - "rtk.modules.buckets.enum_buckets"
+  - "rtk.modules.buckets.cors_traversal"
+  - "rtk.modules.gis_meteo.ogc_anonymous_access"
+  - "rtk.modules.secrets.multi_repo_scan"
+  - "rtk.modules.secrets.error_leakage"
+  - "rtk.modules.iam.wildcard_policies"
+  - "rtk.modules.network.external_surface"
+  - "rtk.modules.llm_mcp.tool_poisoning_watch"
+  - "rtk.modules.llm_mcp.exfil_channels"
+env_tag_required: "redteam-test"
+```
+
+```bash
+mkdir -p missions
+poetry run rtk scope scope.yaml
+MISSION_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
+TARGET='{"cloud":"gcp","account_id":"VOTRE_PROJET_GCP_SANDBOX","region":"europe-west1"}'
+```
 
 ---
 
-## 4. `secrets.multi_repo_scan` — clé de service account committée puis supprimée
+## 1. `buckets.enum_buckets` (RTK-04) — bucket GCS public oublié
+
+**Description.** Simule un bucket de sauvegarde créé selon une convention de nommage prévisible (`org-env-suffix`) et laissé en lecture anonyme. Le module génère les noms candidats et tente un `GET` anonyme sur `storage.googleapis.com/{bucket}` (API XML).
+
+**Service à déployer sur GCP :**
+
+```bash
+ORG="acme"; ENV="dev"; SUFFIX="backup"
+BUCKET="${ORG}-${ENV}-${SUFFIX}"
+
+gsutil mb -l europe-west1 gs://$BUCKET
+echo "decoy-internal-report" > decoy.txt
+gsutil cp decoy.txt gs://$BUCKET/decoy.txt
+
+gsutil uniformbucketlevelaccess set on gs://$BUCKET
+gsutil iam ch allUsers:objectViewer gs://$BUCKET   # <- la mauvaise config testée
+
+# Labels pour traçabilité/nettoyage (pas un vrai "tag" IAM, juste un label GCS)
+gsutil label ch -l redteam:authorized gs://$BUCKET
+gsutil label ch -l engagement:eng-2026-lab-gcp gs://$BUCKET
+
+# Activer les logs d'accès (pour la consultation plus bas)
+gsutil mb -l europe-west1 gs://${ORG}-logs-sink
+gsutil iam ch group:cloud-storage-analytics@google.com:objectCreator gs://${ORG}-logs-sink
+gsutil logging set on -b gs://${ORG}-logs-sink gs://$BUCKET
+```
+
+**Configuration RTK / shell d'invocation :**
+
+```bash
+poetry run rtk run buckets.enum_buckets \
+  --target "$TARGET" \
+  --scope scope.yaml \
+  --db ./missions/eng-001.db \
+  --mission-id $MISSION_ID \
+  --org acme \
+  --envs dev,staging,prod
+```
+
+(`--org`/`--envs` génèrent en interne les suffixes `data,logs,backup,assets,tiles,raw,dem,radar` — assurez-vous que votre bucket réel figure dans le produit cartésien généré.)
+
+**Logs côté cible :**
+
+- Cloud Console → *Cloud Storage* → bucket → onglet **Logs d'accès** (fichiers CSV horaires dans `gs://acme-logs-sink`), ou :
+- `gcloud logging read 'resource.type="gcs_bucket" AND protoPayload.methodName=("storage.objects.list" OR "storage.objects.get")' --project=VOTRE_PROJET_GCP_SANDBOX --limit=50` (nécessite d'avoir activé les Data Access audit logs pour Cloud Storage dans IAM → Journaux d'audit, car ils sont désactivés par défaut).
+
+---
+
+## 2. `buckets.cors_traversal` (RTK-05) — CORS permissif + traversée
+
+**Description.** GCS natif ne supporte pas `Access-Control-Allow-Credentials`, donc le test « credentials reflétés » de RTK-05 ne se déclenche jamais contre un bucket GCS brut. Pour obtenir un vrai finding « confirmed », il faut une petite API Cloud Run volontairement vulnérable servant de proxy devant des fichiers — schéma classique d'un « service de tuiles » legacy oublié, exactement le cas d'usage visé par le module.
+
+**Service à déployer sur GCP (Cloud Run) :**
+
+`app.py` (fixture de lab, volontairement vulnérable — **à ne jamais exposer hors du sandbox**) :
+
+```python
+import os
+from flask import Flask, request, send_from_directory, Response
+
+app = Flask(__name__)
+BASE_DIR = "/tiles"
+
+@app.route("/<path:filepath>", methods=["GET", "OPTIONS"])
+def serve(filepath):
+    if request.method == "OPTIONS":
+        resp = Response(status=204)
+    else:
+        # Vulnérabilité volontaire : pas de sanitisation du chemin -> traversée
+        resp = send_from_directory(BASE_DIR, filepath)
+    # Vulnérabilité volontaire : reflet de l'origine + credentials=true
+    origin = request.headers.get("Origin", "*")
+    resp.headers["Access-Control-Allow-Origin"] = origin
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+```
+
+```bash
+mkdir tiles && echo "fake-tile-data" > tiles/tile_1_1.png
+echo "TOP-SECRET-DECOY" > secret.txt  # hors de /tiles, pour le test de traversée
+cat > Dockerfile << 'EOF'
+FROM python:3.12-slim
+RUN pip install flask
+WORKDIR /app
+COPY app.py .
+COPY tiles /tiles
+COPY secret.txt /secret.txt
+CMD ["python", "app.py"]
+EOF
+
+gcloud builds submit --tag gcr.io/VOTRE_PROJET_GCP_SANDBOX/legacy-tile-server
+gcloud run deploy legacy-tile-server \
+  --image gcr.io/VOTRE_PROJET_GCP_SANDBOX/legacy-tile-server \
+  --region europe-west1 \
+  --allow-unauthenticated \
+  --labels redteam=authorized,engagement=eng-2026-lab-gcp
+```
+
+**Configuration RTK** — `buckets.json` (correspond au modèle `BucketInfo` : `name`, `cloud`, `region`, `url`) :
+
+```json
+[
+  {
+    "name": "legacy-tile-server",
+    "cloud": "gcp",
+    "region": "europe-west1",
+    "url": "https://legacy-tile-server-xxxxx-ew.a.run.app/tile_1_1.png"
+  }
+]
+```
+
+**Shell d'invocation :**
+
+```bash
+poetry run rtk run buckets.cors_traversal \
+  --target "$TARGET" \
+  --scope scope.yaml \
+  --db ./missions/eng-001.db \
+  --mission-id $MISSION_ID \
+  --buckets-file buckets.json
+```
+
+**Logs côté cible :** Cloud Run écrit automatiquement ses requêtes HTTP dans Cloud Logging :
+
+```bash
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="legacy-tile-server"' \
+  --project=VOTRE_PROJET_GCP_SANDBOX --limit=50 --format=json
+```
+
+Vous y verrez le user-agent RTK (`httpx`), l'en-tête `Origin: https://evil.example.com`, et les tentatives de payloads de traversée (`../secret.txt`, etc.).
+
+---
+
+## 3. `gis_meteo.ogc_anonymous_access` (RTK-20) — couche WMS sensible exposée
+
+**Description.** Détecte un service OGC (WMS/WFS) accessible anonymement et exposant une couche dont le nom matche des motifs sensibles (`internal`, `rgpd`, `réseau_eau`, etc. — voir `SENSITIVE_LAYER_PATTERNS`).
+
+**Service à déployer sur GCP :** GeoServer via Cloud Run (image officielle, config via REST au démarrage).
+
+```bash
+gcloud run deploy geoserver-lab \
+  --image docker.io/kartoza/geoserver:2.25.1 \
+  --region europe-west1 \
+  --memory 2Gi \
+  --set-env-vars GEOSERVER_ADMIN_USER=admin,GEOSERVER_ADMIN_PASSWORD=ChangeMeLab123! \
+  --allow-unauthenticated \
+  --labels redteam=authorized,engagement=eng-2026-lab-gcp
+
+GS_URL=$(gcloud run services describe geoserver-lab --region europe-west1 --format='value(status.url)')
+
+# Créer un workspace + un datastore mémoire + une couche au nom "sensible"
+curl -u admin:ChangeMeLab123! -XPOST -H "Content-type: text/xml" \
+  -d "<workspace><name>lab</name></workspace>" \
+  "$GS_URL/geoserver/rest/workspaces"
+
+curl -u admin:ChangeMeLab123! -XPOST -H "Content-type: application/json" \
+  -d '{"dataStore":{"name":"sample","connectionParameters":{"entry":[{"@key":"directory","$":"file:data/shapefiles"}]}}}' \
+  "$GS_URL/geoserver/rest/workspaces/lab/datastores"
+# -> Publier une couche existante du jeu de données d'exemple GeoServer en la renommant
+curl -u admin:ChangeMeLab123! -XPOST -H "Content-type: text/xml" \
+  -d "<featureType><name>donnees_rgpd_employes</name><nativeName>archsites</nativeName></featureType>" \
+  "$GS_URL/geoserver/rest/workspaces/lab/datastores/sample/featuretypes"
+```
+
+**Shell d'invocation :**
+
+```bash
+poetry run rtk run gis_meteo.ogc_anonymous_access \
+  --target "$TARGET" \
+  --scope scope.yaml \
+  --db ./missions/eng-001.db \
+  --mission-id $MISSION_ID \
+  --ogc-endpoints "$GS_URL/geoserver/lab/wfs"
+```
+
+**Logs côté cible :**
+
+```bash
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="geoserver-lab"' \
+  --project=VOTRE_PROJET_GCP_SANDBOX --limit=50
+```
+
+Vous y verrez les requêtes `GetCapabilities` d'`owslib`, et dans les logs applicatifs GeoServer (même flux Cloud Logging) le détail des couches servies.
+
+---
+
+## 4. `secrets.multi_repo_scan` (RTK-01) — clé de service account committée puis supprimée
 
 **Description.** `gitleaks` scanne l'historique Git complet (y compris les commits supprimés). Scénario classique : un développeur commit une clé JSON de service account, s'en rend compte, et fait un nouveau commit qui la supprime — en pensant le secret disparu.
 
@@ -68,7 +296,7 @@ poetry run rtk run secrets.multi_repo_scan \
 
 ---
 
-## 5. `secrets.error_leakage` — stack trace exposant une ARN/clé dans une 500
+## 5. `secrets.error_leakage` (RTK-02) — stack trace exposant une ARN/clé dans une 500
 
 **Description.** Le module fuzze une liste d'endpoints avec des payloads malformés (JSON invalide, injection SQL basique, header forgé, payload surdimensionné) et grep les réponses 5xx à la recherche de secrets (clé API GCP `AIza...`, ARN AWS, chemins `/etc/secrets/`, patterns génériques `password=`/`token=`).
 
@@ -112,7 +340,7 @@ poetry run rtk run secrets.error_leakage \
 
 ---
 
-## 6. `iam.wildcard_policies` — rôle IAM GCP personnalisé trop permissif
+## 6. `iam.wildcard_policies` (RTK-07) — rôle IAM GCP personnalisé trop permissif
 
 **Description.** Ce module est cloud-agnostique : il lit des fichiers JSON de policies au format IAM (`Statement`/`Action`/`Resource`) dans un répertoire local et flague les wildcards dangereux. Il n'appelle aucune API cloud. Pour un lab GCP, l'astuce consiste à exporter un **rôle personnalisé** GCP et à le reformater dans le schéma attendu par le module (style AWS), ou à committer volontairement une policy Terraform/JSON mal conçue destinée à GCP.
 
@@ -161,7 +389,7 @@ poetry run rtk run iam.wildcard_policies \
 
 ---
 
-## 7. `network.external_surface` — endpoint MCP oublié sur un sous-domaine
+## 7. `network.external_surface` (RTK-08) — endpoint MCP oublié sur un sous-domaine
 
 **Description.** Énumère les sous-domaines (via `subfinder`, si installé) puis fingerprint chaque endpoint trouvé pour détecter un serveur MCP, une API LLM ou un service WMS exposé par erreur.
 
@@ -194,7 +422,7 @@ poetry run rtk run network.external_surface \
 
 ---
 
-## 8 & 9. `llm_mcp.tool_poisoning_watch` + `llm_mcp.exfil_channels` — serveur MCP sur Cloud Run
+## 8 & 9. `llm_mcp.tool_poisoning_watch` (RTK-13) + `llm_mcp.exfil_channels` (RTK-14) — serveur MCP sur Cloud Run
 
 **Description commune.** Les deux modules ciblent un serveur MCP exposé en HTTP/JSON-RPC (`tools/list`, `tools/call`) :
 
@@ -263,6 +491,26 @@ poetry run rtk run llm_mcp.exfil_channels \
 Ces deux modules restent utiles si vous testez un jour une architecture multi-cloud incluant un compte AWS réel dans le scope.
 
 ---
+
+## Consultation groupée des résultats RTK
+
+```bash
+poetry run rtk findings --db ./missions/eng-001.db --mission-id $MISSION_ID
+poetry run rtk report --db ./missions/eng-001.db --mission-id $MISSION_ID --output rapport.html
+```
+
+## Nettoyage après tests
+
+```bash
+gsutil -m rm -r gs://acme-dev-backup
+gcloud run services delete legacy-tile-server --region europe-west1 -q
+gcloud run services delete geoserver-lab --region europe-west1 -q
+gcloud run services delete error-leak-lab --region europe-west1 -q
+gcloud run services delete mcp-lab --region europe-west1 -q
+gcloud source repos delete lab-rtk-secrets --project=VOTRE_PROJET_GCP_SANDBOX -q
+gcloud iam roles delete labOverPermissive --project=VOTRE_PROJET_GCP_SANDBOX -q
+gcloud iam service-accounts delete lab-decoy-sa@VOTRE_PROJET_GCP_SANDBOX.iam.gserviceaccount.com -q
+```
 
 ## Rappel : hygiène de lab
 
